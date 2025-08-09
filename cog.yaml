@@ -1,6 +1,8 @@
 build:
-  dockerfile: Dockerfile
   gpu: true
+  python_version: "3.10"
+  cuda: "12.1"
+  python_requirements: requirements.txt
+  cog_runtime: true
 
 predict: model.py:Predictor
-
