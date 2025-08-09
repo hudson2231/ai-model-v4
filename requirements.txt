@@ -1,9 +1,19 @@
-diffusers==0.24.0
-transformers==4.37.2
+--extra-index-url https://download.pytorch.org/whl/cu121
+torch==2.1.0+cu121
+torchvision==0.16.0+cu121
+
+# Fix the cached_download import problem by using a newer diffusers
+diffusers==0.27.2
+transformers==4.38.2
 accelerate==0.27.2
-controlnet-aux==0.0.7
+xformers==0.0.23
+
 opencv-python==4.9.0.80
 Pillow==10.3.0
-safetensors>=0.3.1,<0.7
-huggingface_hub>=0.19.4,<0.35
-xformers==0.0.23
+controlnet-aux==0.0.7
+safetensors>=0.4.2
+
+# Avoid the NumPy 2.x breakage:
+numpy<2
+# Keep hub at a version diffusers 0.27.x supports well
+huggingface_hub==0.22.2
