@@ -1,8 +1,6 @@
---default-timeout=180
---retries=5
---no-cache-dir
---prefer-binary
-
+--extra-index-url https://download.pytorch.org/whl/cu121
+torch==2.1.0+cu121
+torchvision==0.16.0+cu121
 diffusers==0.27.2
 transformers==4.38.2
 accelerate==0.27.2
