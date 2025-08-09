@@ -1,19 +1,19 @@
-# REMOVE torch & torchvision here (they're in the base image)
-# --extra-index-url not needed once torch/torchvision are gone
+--default-timeout=180
+--retries=5
+--no-cache-dir
+--prefer-binary
 
-# Core libs
+--extra-index-url https://download.pytorch.org/whl/cu121
+torch==2.1.0+cu121
+torchvision==0.16.0+cu121
+
 diffusers==0.27.2
 transformers==4.38.2
 accelerate==0.27.2
-# xformers REMOVED to avoid huge wheel & OOM
 
 opencv-python-headless==4.9.0.80
 Pillow==10.3.0
 controlnet-aux==0.0.7
 safetensors>=0.4.2
-
-# Avoid NumPy 2.x breakage:
 numpy<2
-
-# Keep hub version aligned with diffusers 0.27.x
 huggingface_hub==0.22.2
