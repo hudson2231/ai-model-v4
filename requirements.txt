@@ -1,0 +1,9 @@
+diffusers==0.24.0
+transformers==4.37.2
+accelerate==0.27.2
+controlnet-aux==0.0.7
+opencv-python==4.9.0.80
+Pillow==10.3.0
+safetensors>=0.3.1,<0.7
+huggingface_hub>=0.19.4,<0.35
+xformers==0.0.23
