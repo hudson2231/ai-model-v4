@@ -10,7 +10,6 @@ from diffusers import (
 )
 from controlnet_aux import HEDdetector, CannyDetector
 
-
 # ---------- helpers ----------
 def _limit_size(img: Image.Image, max_side: int) -> Image.Image:
     w, h = img.size
@@ -21,7 +20,6 @@ def _limit_size(img: Image.Image, max_side: int) -> Image.Image:
     W, H = int(w * s), int(h * s)
     W, H = (W // 8) * 8, (H // 8) * 8
     return img.resize((max(W, 8), max(H, 8)), Image.BILINEAR)
-
 
 class Predictor(BasePredictor):
     def setup(self):
@@ -37,15 +35,13 @@ class Predictor(BasePredictor):
         os.environ["HF_HUB_ENABLE_HF_TRANSFER"] = "1"
         os.environ["TOKENIZERS_PARALLELISM"] = "false"
 
-        print("[setup] load ControlNet HED …", flush=True)
+        print("[setup] load ControlNet HED model + SD1.5 …", flush=True)
         self.controlnet = ControlNetModel.from_pretrained(
             "lllyasviel/sd-controlnet-hed",
             torch_dtype=torch.float16,
             use_safetensors=True,
             variant="fp16",
         )
-
-        print("[setup] load SD1.5 pipeline …", flush=True)
         self.pipe = StableDiffusionControlNetPipeline.from_pretrained(
             "runwayml/stable-diffusion-v1-5",
             controlnet=self.controlnet,
@@ -81,15 +77,21 @@ class Predictor(BasePredictor):
         except Exception:
             pass
 
-        print("[setup] load detectors …", flush=True)
-        self.hed = HEDdetector.from_pretrained("lllyasviel/ControlNet", cache_dir=os.environ["HF_HOME"])
-        try:
-            self.hed.to("cuda")
-            print("[setup] HED on CUDA", flush=True)
-        except Exception:
-            print("[setup] HED stays on CPU", flush=True)
-
+        print("[setup] load edge detectors …", flush=True)
         self.canny = CannyDetector()
+
+        # IMPORTANT: load HED from the correct repo and don’t crash if unavailable
+        self.hed = None
+        try:
+            # correct repo for ControlNetHED.pth is lllyasviel/Annotators
+            self.hed = HEDdetector.from_pretrained("lllyasviel/Annotators", cache_dir=os.environ["HF_HOME"])
+            try:
+                self.hed.to("cuda")
+                print("[setup] HED on CUDA", flush=True)
+            except Exception:
+                print("[setup] HED stays on CPU", flush=True)
+        except Exception as e:
+            print(f"[setup] HED load failed, will fallback to Canny at runtime: {e}", flush=True)
 
         # Prompts
         self.prompt = (
@@ -142,14 +144,15 @@ class Predictor(BasePredictor):
         image = Image.open(input_image).convert("RGB")
         image = _limit_size(image, max_side)
 
-        print(f"[predict] edges via {edge_detector} at {image.size} …", flush=True)
+        use_hed = edge_detector == "hed" and self.hed is not None
+        print(f"[predict] edges via {'hed' if use_hed else 'canny'} at {image.size} …", flush=True)
         try:
-            if edge_detector == "hed":
+            if use_hed:
                 edge = self.hed(image).resize(image.size)
             else:
                 edge = self.canny(image, low_threshold=50, high_threshold=150)
-        except Exception:
-            print("[predict] HED failed → using Canny", flush=True)
+        except Exception as _:
+            print("[predict] edge failed → fallback to Canny", flush=True)
             edge = self.canny(image, low_threshold=50, high_threshold=150)
 
         def _on_step_end(pipe, i, t, **kwargs):
@@ -182,12 +185,9 @@ class Predictor(BasePredictor):
                 print("[predict] OOM → retry smaller …", flush=True)
                 image = _limit_size(image, max(512, int(max_side * 0.8)))
                 try:
-                    if edge_detector == "hed":
-                        edge = self.hed(image).resize(image.size)
-                    else:
-                        edge = self.canny(image, low_threshold=50, high_threshold=150)
-                except Exception:
                     edge = self.canny(image, low_threshold=50, high_threshold=150)
+                except Exception:
+                    pass
                 steps = max(12, int(steps * 0.8))
                 guidance = max(6.0, min(guidance, 10.0))
                 result = run(steps, guidance)
@@ -206,4 +206,3 @@ class Predictor(BasePredictor):
         result.save(out_path, format="PNG", optimize=False)
         print(f"[predict] done in {time.time() - t0:.1f}s -> {out_path}", flush=True)
         return Path(out_path)
-
