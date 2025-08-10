@@ -25,6 +25,11 @@ def _limit_size(img: Image.Image, max_side: int) -> Image.Image:
 
 class Predictor(BasePredictor):
     def setup(self):
+        # Fail fast if GPU missing
+        if not torch.cuda.is_available():
+            raise RuntimeError("GPU not available. On Replicate, pick L40S or A100.")
+        print(f"[setup] CUDA device: {torch.cuda.get_device_name(0)}", flush=True)
+
         # Caches + faster downloads
         os.environ["HF_HOME"] = "/root/.cache/huggingface"
         os.environ["TRANSFORMERS_CACHE"] = "/root/.cache/huggingface"
@@ -78,6 +83,12 @@ class Predictor(BasePredictor):
 
         print("[setup] load detectors …", flush=True)
         self.hed = HEDdetector.from_pretrained("lllyasviel/ControlNet", cache_dir=os.environ["HF_HOME"])
+        try:
+            self.hed.to("cuda")
+            print("[setup] HED on CUDA", flush=True)
+        except Exception:
+            print("[setup] HED stays on CPU", flush=True)
+
         self.canny = CannyDetector()
 
         # Prompts
@@ -94,7 +105,7 @@ class Predictor(BasePredictor):
             "extra objects, extra limbs, incorrect anatomy, low detail"
         )
 
-        # Warmup so first predict returns quickly (pulls weights, inits kernels)
+        # Warmup so first predict returns quickly
         try:
             print("[setup] warmup …", flush=True)
             dummy = Image.new("RGB", (96, 96), (255, 255, 255))
@@ -132,7 +143,6 @@ class Predictor(BasePredictor):
         image = _limit_size(image, max_side)
 
         print(f"[predict] edges via {edge_detector} at {image.size} …", flush=True)
-        # Robust edge: try chosen detector; fallback to canny if HED is slow/problematic
         try:
             if edge_detector == "hed":
                 edge = self.hed(image).resize(image.size)
@@ -142,7 +152,6 @@ class Predictor(BasePredictor):
             print("[predict] HED failed → using Canny", flush=True)
             edge = self.canny(image, low_threshold=50, high_threshold=150)
 
-        # Progress callback so logs show it's alive
         def _on_step_end(pipe, i, t, **kwargs):
             if i % 5 == 0:
                 print(f"[predict] diffusion step {i}", flush=True)
@@ -172,7 +181,6 @@ class Predictor(BasePredictor):
             if "CUDA out of memory" in str(e) or "cublas" in str(e):
                 print("[predict] OOM → retry smaller …", flush=True)
                 image = _limit_size(image, max(512, int(max_side * 0.8)))
-                # recompute edge at new size
                 try:
                     if edge_detector == "hed":
                         edge = self.hed(image).resize(image.size)
@@ -198,3 +206,4 @@ class Predictor(BasePredictor):
         result.save(out_path, format="PNG", optimize=False)
         print(f"[predict] done in {time.time() - t0:.1f}s -> {out_path}", flush=True)
         return Path(out_path)
+
