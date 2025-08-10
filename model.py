@@ -8,7 +8,7 @@ from diffusers import (
     ControlNetModel,
     UniPCMultistepScheduler,
 )
-from controlnet_aux import HEDdetector, CannyDetector
+from controlnet_aux import CannyDetector
 
 # ---------- helpers ----------
 def _limit_size(img: Image.Image, max_side: int) -> Image.Image:
@@ -35,9 +35,9 @@ class Predictor(BasePredictor):
         os.environ["HF_HUB_ENABLE_HF_TRANSFER"] = "1"
         os.environ["TOKENIZERS_PARALLELISM"] = "false"
 
-        print("[setup] load ControlNet HED model + SD1.5 …", flush=True)
+        print("[setup] load ControlNet Canny + SD1.5 …", flush=True)
         self.controlnet = ControlNetModel.from_pretrained(
-            "lllyasviel/sd-controlnet-hed",
+            "lllyasviel/sd-controlnet-canny",
             torch_dtype=torch.float16,
             use_safetensors=True,
             variant="fp16",
@@ -77,21 +77,8 @@ class Predictor(BasePredictor):
         except Exception:
             pass
 
-        print("[setup] load edge detectors …", flush=True)
+        print("[setup] load Canny detector …", flush=True)
         self.canny = CannyDetector()
-
-        # IMPORTANT: load HED from the correct repo and don’t crash if unavailable
-        self.hed = None
-        try:
-            # correct repo for ControlNetHED.pth is lllyasviel/Annotators
-            self.hed = HEDdetector.from_pretrained("lllyasviel/Annotators", cache_dir=os.environ["HF_HOME"])
-            try:
-                self.hed.to("cuda")
-                print("[setup] HED on CUDA", flush=True)
-            except Exception:
-                print("[setup] HED stays on CPU", flush=True)
-        except Exception as e:
-            print(f"[setup] HED load failed, will fallback to Canny at runtime: {e}", flush=True)
 
         # Prompts
         self.prompt = (
@@ -133,27 +120,16 @@ class Predictor(BasePredictor):
         guidance: float = Input(description="CFG", default=8.5, ge=1.0, le=20.0),
         max_side: int = Input(description="Max image side px", default=704, ge=512, le=1024),
         seed: int = Input(description="Seed", default=42),
-        edge_detector: str = Input(
-            description="Edge detector: 'canny' (fast, robust) or 'hed' (slower, cleaner)",
-            default="canny",
-            choices=["canny", "hed"],
-        ),
+        canny_low: int = Input(description="Canny low threshold", default=50, ge=1, le=255),
+        canny_high: int = Input(description="Canny high threshold", default=150, ge=1, le=255),
     ) -> Path:
         t0 = time.time()
         print("[predict] load image …", flush=True)
         image = Image.open(input_image).convert("RGB")
         image = _limit_size(image, max_side)
 
-        use_hed = edge_detector == "hed" and self.hed is not None
-        print(f"[predict] edges via {'hed' if use_hed else 'canny'} at {image.size} …", flush=True)
-        try:
-            if use_hed:
-                edge = self.hed(image).resize(image.size)
-            else:
-                edge = self.canny(image, low_threshold=50, high_threshold=150)
-        except Exception as _:
-            print("[predict] edge failed → fallback to Canny", flush=True)
-            edge = self.canny(image, low_threshold=50, high_threshold=150)
+        print(f"[predict] edges via canny at {image.size} …", flush=True)
+        edge = self.canny(image, low_threshold=canny_low, high_threshold=canny_high)
 
         def _on_step_end(pipe, i, t, **kwargs):
             if i % 5 == 0:
@@ -184,20 +160,14 @@ class Predictor(BasePredictor):
             if "CUDA out of memory" in str(e) or "cublas" in str(e):
                 print("[predict] OOM → retry smaller …", flush=True)
                 image = _limit_size(image, max(512, int(max_side * 0.8)))
-                try:
-                    edge = self.canny(image, low_threshold=50, high_threshold=150)
-                except Exception:
-                    pass
+                edge = self.canny(image, low_threshold=canny_low, high_threshold=canny_high)
                 steps = max(12, int(steps * 0.8))
                 guidance = max(6.0, min(guidance, 10.0))
                 result = run(steps, guidance)
             else:
                 print(f"[predict] error: {e} → retry smaller …", flush=True)
                 image = _limit_size(image, max(512, int(max_side * 0.8)))
-                try:
-                    edge = self.canny(image, low_threshold=50, high_threshold=150)
-                except Exception:
-                    pass
+                edge = self.canny(image, low_threshold=canny_low, high_threshold=canny_high)
                 steps = max(12, int(steps * 0.8))
                 guidance = max(6.0, min(guidance, 10.0))
                 result = run(steps, guidance)
