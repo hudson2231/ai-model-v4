@@ -1,6 +1,5 @@
 import os, time
 import torch
-from torch import autocast
 from cog import BasePredictor, Input, Path
 from PIL import Image
 
@@ -9,10 +8,10 @@ from diffusers import (
     ControlNetModel,
     UniPCMultistepScheduler,
 )
-from controlnet_aux import HEDdetector
+from controlnet_aux import HEDdetector, CannyDetector
 
 
-# --- helpers ---
+# ---------- helpers ----------
 def _limit_size(img: Image.Image, max_side: int) -> Image.Image:
     w, h = img.size
     if max(w, h) <= max_side:
@@ -33,7 +32,7 @@ class Predictor(BasePredictor):
         os.environ["HF_HUB_ENABLE_HF_TRANSFER"] = "1"
         os.environ["TOKENIZERS_PARALLELISM"] = "false"
 
-        print("[setup] loading ControlNet (HED) …", flush=True)
+        print("[setup] load ControlNet HED …", flush=True)
         self.controlnet = ControlNetModel.from_pretrained(
             "lllyasviel/sd-controlnet-hed",
             torch_dtype=torch.float16,
@@ -41,7 +40,7 @@ class Predictor(BasePredictor):
             variant="fp16",
         )
 
-        print("[setup] loading SD1.5 pipeline …", flush=True)
+        print("[setup] load SD1.5 pipeline …", flush=True)
         self.pipe = StableDiffusionControlNetPipeline.from_pretrained(
             "runwayml/stable-diffusion-v1-5",
             controlnet=self.controlnet,
@@ -50,14 +49,12 @@ class Predictor(BasePredictor):
             safety_checker=None,
             variant="fp16",
         )
-
-        # Sampler + perf toggles
         self.pipe.scheduler = UniPCMultistepScheduler.from_config(self.pipe.scheduler.config)
+
+        # Perf toggles
         try:
-            self.pipe.enable_sdpa()
-        except Exception:
-            pass
-        try:
+            if hasattr(self.pipe, "enable_sdpa"):
+                self.pipe.enable_sdpa()
             self.pipe.enable_vae_slicing()
             self.pipe.enable_vae_tiling()
             self.pipe.enable_attention_slicing("max")
@@ -71,12 +68,17 @@ class Predictor(BasePredictor):
         except Exception:
             pass
 
-        print("[setup] moving pipeline to CUDA …", flush=True)
+        print("[setup] move pipeline to CUDA …", flush=True)
         self.pipe.to("cuda")
+        try:
+            self.pipe.unet.to(memory_format=torch.channels_last)
+            self.pipe.vae.to(memory_format=torch.channels_last)
+        except Exception:
+            pass
 
-        print("[setup] loading HED detector …", flush=True)
-        # controlnet-aux returns a callable that outputs a PIL image
+        print("[setup] load detectors …", flush=True)
         self.hed = HEDdetector.from_pretrained("lllyasviel/ControlNet", cache_dir=os.environ["HF_HOME"])
+        self.canny = CannyDetector()
 
         # Prompts
         self.prompt = (
@@ -92,6 +94,25 @@ class Predictor(BasePredictor):
             "extra objects, extra limbs, incorrect anatomy, low detail"
         )
 
+        # Warmup so first predict returns quickly (pulls weights, inits kernels)
+        try:
+            print("[setup] warmup …", flush=True)
+            dummy = Image.new("RGB", (96, 96), (255, 255, 255))
+            dummy_edge = self.canny(dummy, low_threshold=50, high_threshold=150)
+            gen = torch.Generator(device="cuda").manual_seed(123)
+            with torch.inference_mode(), torch.autocast("cuda", dtype=torch.float16):
+                _ = self.pipe(
+                    prompt="line art",
+                    negative_prompt=self.negative,
+                    image=dummy_edge,
+                    num_inference_steps=1,
+                    guidance_scale=1.0,
+                    generator=gen,
+                ).images[0]
+            print("[setup] warmup done", flush=True)
+        except Exception as e:
+            print(f"[setup] warmup skipped: {e}", flush=True)
+
     def predict(
         self,
         input_image: Path = Input(description="Photo to convert into printable line art"),
@@ -99,25 +120,38 @@ class Predictor(BasePredictor):
         guidance: float = Input(description="CFG", default=8.5, ge=1.0, le=20.0),
         max_side: int = Input(description="Max image side px", default=704, ge=512, le=1024),
         seed: int = Input(description="Seed", default=42),
+        edge_detector: str = Input(
+            description="Edge detector: 'canny' (fast, robust) or 'hed' (slower, cleaner)",
+            default="canny",
+            choices=["canny", "hed"],
+        ),
     ) -> Path:
         t0 = time.time()
-        print("[predict] loading image …", flush=True)
+        print("[predict] load image …", flush=True)
         image = Image.open(input_image).convert("RGB")
         image = _limit_size(image, max_side)
 
-        print(f"[predict] HED edges at {image.size} …", flush=True)
-        edge = self.hed(image).resize(image.size)
+        print(f"[predict] edges via {edge_detector} at {image.size} …", flush=True)
+        # Robust edge: try chosen detector; fallback to canny if HED is slow/problematic
+        try:
+            if edge_detector == "hed":
+                edge = self.hed(image).resize(image.size)
+            else:
+                edge = self.canny(image, low_threshold=50, high_threshold=150)
+        except Exception:
+            print("[predict] HED failed → using Canny", flush=True)
+            edge = self.canny(image, low_threshold=50, high_threshold=150)
 
-        # progress callback so logs show it's alive
+        # Progress callback so logs show it's alive
         def _on_step_end(pipe, i, t, **kwargs):
             if i % 5 == 0:
                 print(f"[predict] diffusion step {i}", flush=True)
 
         gen = torch.Generator(device="cuda").manual_seed(seed)
 
-        def run(sd_image, sd_steps, sd_guidance):
-            with torch.inference_mode(), autocast("cuda"):
-                return self.pipe(
+        def run(sd_steps, sd_guidance):
+            with torch.inference_mode(), torch.autocast("cuda", dtype=torch.float16):
+                img = self.pipe(
                     prompt=self.prompt,
                     negative_prompt=self.negative,
                     image=edge,
@@ -127,23 +161,40 @@ class Predictor(BasePredictor):
                     callback_on_step_end=_on_step_end,
                     callback_on_step_end_tensor_inputs=["latents"],
                 ).images[0]
+            torch.cuda.synchronize()
+            torch.cuda.empty_cache()
+            return img
 
         try:
-            print(f"[predict] generating (steps={steps}, guidance={guidance}) …", flush=True)
-            result = run(image, steps, guidance)
+            print(f"[predict] generate (steps={steps}, guidance={guidance}) …", flush=True)
+            result = run(steps, guidance)
         except RuntimeError as e:
             if "CUDA out of memory" in str(e) or "cublas" in str(e):
-                print("[predict] OOM detected, retrying smaller …", flush=True)
+                print("[predict] OOM → retry smaller …", flush=True)
                 image = _limit_size(image, max(512, int(max_side * 0.8)))
-                # recompute edges at new size
-                edge = self.hed(image).resize(image.size)
+                # recompute edge at new size
+                try:
+                    if edge_detector == "hed":
+                        edge = self.hed(image).resize(image.size)
+                    else:
+                        edge = self.canny(image, low_threshold=50, high_threshold=150)
+                except Exception:
+                    edge = self.canny(image, low_threshold=50, high_threshold=150)
                 steps = max(12, int(steps * 0.8))
                 guidance = max(6.0, min(guidance, 10.0))
-                result = run(image, steps, guidance)
+                result = run(steps, guidance)
             else:
-                raise
+                print(f"[predict] error: {e} → retry smaller …", flush=True)
+                image = _limit_size(image, max(512, int(max_side * 0.8)))
+                try:
+                    edge = self.canny(image, low_threshold=50, high_threshold=150)
+                except Exception:
+                    pass
+                steps = max(12, int(steps * 0.8))
+                guidance = max(6.0, min(guidance, 10.0))
+                result = run(steps, guidance)
 
         out_path = "/tmp/output.png"
-        result.save(out_path)
+        result.save(out_path, format="PNG", optimize=False)
         print(f"[predict] done in {time.time() - t0:.1f}s -> {out_path}", flush=True)
         return Path(out_path)
