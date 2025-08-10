@@ -1,8 +1,13 @@
 build:
   gpu: true
-  python_version: "3.10"
   cuda: "12.1"
-  python_requirements: requirements.txt
-  cog_runtime: true
-
-predict: model.py:Predictor
+  python_version: "3.10"
+  python_packages:
+    - torch==2.1.0
+    - torchvision==0.16.0
+    - diffusers==0.27.2
+    - controlnet-aux==0.0.7
+    - transformers==4.39.3
+    - safetensors
+    - pillow
+predict: "model.py:Predictor"
