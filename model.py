@@ -121,7 +121,7 @@ class Predictor(BasePredictor):
                     prompt=self.prompt,
                     negative_prompt=self.negative,
                     image=edge,
-                    num_inference_steps sd_steps,
+                    num_inference_steps=sd_steps,
                     guidance_scale=sd_guidance,
                     generator=gen,
                     callback_on_step_end=_on_step_end,
