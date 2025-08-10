@@ -1,6 +1,6 @@
-import os
+import os, time
 import torch
-import numpy as np
+from torch import autocast
 from cog import BasePredictor, Input, Path
 from PIL import Image
 
@@ -9,7 +9,6 @@ from diffusers import (
     ControlNetModel,
     UniPCMultistepScheduler,
 )
-
 from controlnet_aux import HEDdetector
 
 
@@ -17,25 +16,24 @@ from controlnet_aux import HEDdetector
 def _limit_size(img: Image.Image, max_side: int) -> Image.Image:
     w, h = img.size
     if max(w, h) <= max_side:
-        # snap to multiple of 8 anyway
-        return img.resize(((w // 8) * 8 or 8, (h // 8) * 8 or 8), Image.BILINEAR)
-    scale = max_side / float(max(w, h))
-    nw, nh = int(w * scale), int(h * scale)
-    nw, nh = (nw // 8) * 8, (nh // 8) * 8
-    nw = max(nw, 8)
-    nh = max(nh, 8)
-    return img.resize((nw, nh), Image.BILINEAR)
+        W, H = (w // 8) * 8, (h // 8) * 8
+        return img.resize((max(W, 8), max(H, 8)), Image.BILINEAR)
+    s = max_side / float(max(w, h))
+    W, H = int(w * s), int(h * s)
+    W, H = (W // 8) * 8, (H // 8) * 8
+    return img.resize((max(W, 8), max(H, 8)), Image.BILINEAR)
 
 
 class Predictor(BasePredictor):
     def setup(self):
-        # Stable cache + faster downloads
+        # Caches + faster downloads
         os.environ["HF_HOME"] = "/root/.cache/huggingface"
         os.environ["TRANSFORMERS_CACHE"] = "/root/.cache/huggingface"
         os.environ["HF_DATASETS_CACHE"] = "/root/.cache/huggingface"
         os.environ["HF_HUB_ENABLE_HF_TRANSFER"] = "1"
+        os.environ["TOKENIZERS_PARALLELISM"] = "false"
 
-        # ControlNet: HED (fp16, safetensors)
+        print("[setup] loading ControlNet (HED) …", flush=True)
         self.controlnet = ControlNetModel.from_pretrained(
             "lllyasviel/sd-controlnet-hed",
             torch_dtype=torch.float16,
@@ -43,7 +41,7 @@ class Predictor(BasePredictor):
             variant="fp16",
         )
 
-        # SD1.5 + ControlNet
+        print("[setup] loading SD1.5 pipeline …", flush=True)
         self.pipe = StableDiffusionControlNetPipeline.from_pretrained(
             "runwayml/stable-diffusion-v1-5",
             controlnet=self.controlnet,
@@ -53,37 +51,34 @@ class Predictor(BasePredictor):
             variant="fp16",
         )
 
-        # Sharp, stable sampler
+        # Sampler + perf toggles
         self.pipe.scheduler = UniPCMultistepScheduler.from_config(self.pipe.scheduler.config)
-
-        # Perf toggles (safe if not available)
+        try:
+            self.pipe.enable_sdpa()
+        except Exception:
+            pass
         try:
             self.pipe.enable_vae_slicing()
             self.pipe.enable_vae_tiling()
             self.pipe.enable_attention_slicing("max")
-            if hasattr(self.pipe, "enable_sdpa"):
-                self.pipe.enable_sdpa()
         except Exception:
             pass
-
-        # Low VRAM safety: disable NSFW checker already done above (safety_checker=None)
         try:
             import torch.backends.cudnn as cudnn
             cudnn.benchmark = True
-        except Exception:
-            pass
-        try:
             torch.set_float32_matmul_precision("high")
+            torch.backends.cuda.matmul.allow_tf32 = True
         except Exception:
             pass
 
-        # Move to GPU
+        print("[setup] moving pipeline to CUDA …", flush=True)
         self.pipe.to("cuda")
 
-        # Load HED once (pin to same cache)
+        print("[setup] loading HED detector …", flush=True)
+        # controlnet-aux returns a callable that outputs a PIL image
         self.hed = HEDdetector.from_pretrained("lllyasviel/ControlNet", cache_dir=os.environ["HF_HOME"])
 
-        # Prompt/negative (single source of truth)
+        # Prompts
         self.prompt = (
             "Ultra-sharp black and white LINE ART of the full scene (subject AND background). "
             "Clean, closed outlines only; no tone, no shading, no gradients, no color. "
@@ -100,32 +95,55 @@ class Predictor(BasePredictor):
     def predict(
         self,
         input_image: Path = Input(description="Photo to convert into printable line art"),
-        steps: int = Input(description="Diffusion steps", default=20, ge=8, le=50),
-        guidance: float = Input(description="CFG (higher = more prompt adherence)", default=9.0, ge=1.0, le=20.0),
-        max_side: int = Input(description="Max image side in px (multiple of 8)", default=768, ge=512, le=1024),
-        seed: int = Input(description="Seed for repeatability", default=42),
+        steps: int = Input(description="Diffusion steps", default=18, ge=8, le=50),
+        guidance: float = Input(description="CFG", default=8.5, ge=1.0, le=20.0),
+        max_side: int = Input(description="Max image side px", default=704, ge=512, le=1024),
+        seed: int = Input(description="Seed", default=42),
     ) -> Path:
-        # Deterministic generator on GPU
-        generator = torch.Generator(device="cuda").manual_seed(seed)
-
-        # Load & size
+        t0 = time.time()
+        print("[predict] loading image …", flush=True)
         image = Image.open(input_image).convert("RGB")
         image = _limit_size(image, max_side)
 
-        # HED edge map at working size (faster than full-res)
+        print(f"[predict] HED edges at {image.size} …", flush=True)
         edge = self.hed(image).resize(image.size)
 
-        # Generate
-        result = self.pipe(
-            prompt=self.prompt,
-            negative_prompt=self.negative,
-            image=edge,
-            num_inference_steps=steps,
-            guidance_scale=guidance,
-            generator=generator,
-        ).images[0]
+        # progress callback so logs show it's alive
+        def _on_step_end(pipe, i, t, **kwargs):
+            if i % 5 == 0:
+                print(f"[predict] diffusion step {i}", flush=True)
+
+        gen = torch.Generator(device="cuda").manual_seed(seed)
+
+        def run(sd_image, sd_steps, sd_guidance):
+            with torch.inference_mode(), autocast("cuda"):
+                return self.pipe(
+                    prompt=self.prompt,
+                    negative_prompt=self.negative,
+                    image=edge,
+                    num_inference_steps sd_steps,
+                    guidance_scale=sd_guidance,
+                    generator=gen,
+                    callback_on_step_end=_on_step_end,
+                    callback_on_step_end_tensor_inputs=["latents"],
+                ).images[0]
+
+        try:
+            print(f"[predict] generating (steps={steps}, guidance={guidance}) …", flush=True)
+            result = run(image, steps, guidance)
+        except RuntimeError as e:
+            if "CUDA out of memory" in str(e) or "cublas" in str(e):
+                print("[predict] OOM detected, retrying smaller …", flush=True)
+                image = _limit_size(image, max(512, int(max_side * 0.8)))
+                # recompute edges at new size
+                edge = self.hed(image).resize(image.size)
+                steps = max(12, int(steps * 0.8))
+                guidance = max(6.0, min(guidance, 10.0))
+                result = run(image, steps, guidance)
+            else:
+                raise
 
         out_path = "/tmp/output.png"
         result.save(out_path)
+        print(f"[predict] done in {time.time() - t0:.1f}s -> {out_path}", flush=True)
         return Path(out_path)
-
