@@ -1,4 +1,3 @@
-cat > cog.yaml <<'YAML'
 build:
   gpu: true
   cuda: "12.1"
@@ -17,4 +16,3 @@ build:
     - safetensors>=0.4.2
     - huggingface_hub==0.22.2
 predict: "model.py:Predictor"
-YAML
