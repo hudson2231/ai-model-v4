@@ -1,3 +1,4 @@
+cat > cog.yaml <<'YAML'
 build:
   gpu: true
   cuda: "12.1"
@@ -6,8 +7,12 @@ build:
     - torch==2.1.0
     - torchvision==0.16.0
     - diffusers==0.27.2
+    - transformers==4.38.2
+    - accelerate==0.27.2
     - controlnet-aux==0.0.7
-    - transformers==4.39.3
-    - safetensors
-    - pillow
+    - opencv-python-headless==4.9.0.80
+    - Pillow==10.3.0
+    - safetensors>=0.4.2
+    - huggingface_hub==0.22.2
 predict: "model.py:Predictor"
+YAML
