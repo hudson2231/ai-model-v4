@@ -1,9 +1,8 @@
-cat > cog.yaml <<'EOF'
 build:
   gpu: true
   cuda: "12.1"
   python_version: "3.10"
   cog_runtime: true
   python_requirements: requirements.txt
+
 predict: "model.py:Predictor"
-EOF
